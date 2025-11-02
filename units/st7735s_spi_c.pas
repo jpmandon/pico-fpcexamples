@@ -1,4 +1,4 @@
-unit st7735r_spi_c;
+unit ST7735S_spi_c;
 {$mode objfpc}
 {$H+}
 {$modeswitch advancedrecords}
@@ -15,11 +15,12 @@ uses
   pico_c;
 
 type
-  TST7735R_SPI = object(TCustomDisplay16Bits)
+  TST7735S_SPI = object(TCustomDisplay16Bits)
     private
       FpSPI : ^TSPI_Registers;
       FPinDC : TPinIdentifier;
       FPinRST : TPinIdentifier;
+      //FInTransaction : boolean;
     protected
       procedure WriteCommand(const command : byte); virtual;
       procedure WriteCommandBytes(const command : byte; constref data : array of byte; Count:longInt=-1); virtual;
@@ -45,7 +46,6 @@ type
       aPinDC  Pin used for switching between Communication between Data and Command Mode
       aPinRST Pin used to reset the display, not needed by all displays, pass TNativePin.None when not needed
       aPhysicalScreenInfo Information about Width/Height and Bitdepth of the connected screen
-      RunInitSequence Allows the automatic run of Init to be ommited, this allows for custom init sequences
     note
       The SPI interface needs to be pre-initialized to required Parameters
       The extra Pins do not need to be initialized
@@ -136,7 +136,7 @@ const
   ST7735_GMCTRP1 =$E0;
   ST7735_GMCTRN1 =$E1;
 
-constructor TST7735R_SPI.Initialize(var SPI : TSpi_Registers;const aPinDC : TPinIdentifier;const aPinRST : TPinIdentifier;aPhysicalScreenInfo : TPhysicalScreenInfo);
+constructor TST7735S_SPI.Initialize(var SPI : TSpi_Registers;const aPinDC : TPinIdentifier;const aPinRST : TPinIdentifier;aPhysicalScreenInfo : TPhysicalScreenInfo);
 begin
     FpSPI := @SPI;
     FPinDC := aPinDC;
@@ -158,58 +158,80 @@ begin
     InitSequence;
 end;
 
-procedure TST7735R_SPI.InitSequence;
+procedure TST7735S_SPI.InitSequence;
 const
-  col1 : array of byte = ($02,$1c,$07,$12,$37,$32,$29,$2d,$29,$25,$2B,$39,$00,$01,$03,$10);
-  col2 : array of byte = ($03,$1d,$07,$06,$2E,$2C,$29,$2D,$2E,$2E,$37,$3F,$00,$00,$02,$10);
+  DELAY=$80;
+  display_init_sequence : array of byte = (
+    // sw reset
+    $01, 0 or DELAY, $96, //150ms
+    // SLPOUT and Delay
+    $11, 0 or DELAY, $FF, //255ms
+    $B1, $03, $01, $2C, $2D,      // _FRMCTR1
+    $B3, $06, $01, $2C, $2D, $01, $2C, $2D,     // _FRMCTR3
+    $B4, $01, $07, // _INVCTR line inversion
+    $C0, $03, $A2, $02, $84, // _PWCTR1 GVDD = 4.7V, 1.0uA
+    $C1, $01, $C5, // _PWCTR2 VGH=14.7V, VGL=-7.35V
+    $C2, $02, $0A, $00, // _PWCTR3 Opamp current small, Boost frequency
+    $C3, $02, $8A, $2A,
+    $C4, $02, $8A, $EE,
+    $C5, $01, $0E, // _VMCTR1 VCOMH = 4V, VOML = -1.1V
+    $20, $00, // _INVOFF
+    $36, $01, $18, // _MADCTL bottom to top refresh
+    // 1 clk cycle nonoverlap, 2 cycle gate rise, 3 cycle osc equalie,
+    // fix on VTL
+    $3A, $01, $05, // COLMOD - 16bit color
+    $E0, $10, $02, $1C, $07, $12, $37, $32, $29, $2D, $29, $25, $2B, $39, $00, $01, $03, $10, // _GMCTRP1 Gamma
+    $E1, $10, $03, $1D, $07, $06, $2E, $2C, $29, $2D, $2E, $2E, $37, $3F, $00, $00, $02, $10, // _GMCTRN1
+    $13, 0 or DELAY, $0A, // _NORON
+    $29, 0 or DELAY, $64, // _DISPON
+    // $36, $01, $C0,  // _MADCTL Default rotation plus BGR encoding
+    $36, $01, $C8,      // _MADCTL Default rotation plus RGB encoding
+    $21, $00      // _INVON
+    );
+var
+  pos : longword;
+  dataCount : longWord;
+  hasDelay : boolean;
+  command : byte;
 begin
-  WriteCommand(ST7735_SWRESET);
-  busy_wait_us_32(150000);
+  pos := 0;
+  repeat
+    command := display_init_sequence[pos];
+    inc(pos);
+    dataCount := display_init_sequence[pos];
 
-  writecommand(ST7735_SLPOUT);   // Sleep out
-  busy_wait_us_32(500000);
+    if dataCount >=DELAY then
+    begin
+      dataCount := datacount and $7f;
+      hasDelay := true;
+    end
+    else
+      hasDelay := false;
 
-  writeCommandBytes(ST7735_FRMCTR1,[$01,$2C,$2D]);
-  writeCommandBytes(ST7735_FRMCTR2,[$01,$2C,$2D]);
-  writeCommandBytes(ST7735_FRMCTR3,[$01,$2C,$2D,$01,$2C,$2D]);
-  writeCommandBytes(ST7735_INVCTR,[$07]);
-  writeCommandBytes(ST7735_PWCTR1,[$A2,$02,$84]);
-  writeCommandBytes(ST7735_PWCTR2,[$C5]);
-  writeCommandBytes(ST7735_PWCTR3,[$0A,$00]);
-  writeCommandBytes(ST7735_PWCTR4,[$8A,$2A]);
-  writeCommandBytes(ST7735_PWCTR5,[$8A,$EE]);
-  writeCommandBytes(ST7735_VMCTR1,[$0E]);
-  writeCommand(ST7735_INVOFF);
+    if datacount = 0 then
+    begin
+      WriteCommand(command);
+      inc(pos);
+    end;
+    if dataCount > 0 then
+    begin
+      inc(pos);
+      writeCommandBytes(command,display_init_sequence[pos],datacount);
+      pos := pos+datacount;
+    end;
+    if hasDelay then
+    begin
+      busy_wait_ms(display_init_sequence[pos]);
+      inc(pos);
+    end;
+  until pos >= longWord(length(display_init_sequence));
 
-  writeCommandBytes(ST7735_MADCTL,[$C0 or ST7735_MADCTL_BGR]);
-  writeCommandBytes(ST7735_COLMOD,[$05]);
-
-  writeCommandWords(ST7735_CASET,[0,127]);    // Column address set
-  writeCommandWords(ST7735_RASET,[0,127]);    // Row address set
-
-  writeCommandBytes(ST7735_PWCTR6,[$11,$15]);
-  writeCommand(ST7735_GMCTRP1);
-  writeDataBytes(col1);
-  writeCommand(ST7735_GMCTRP1);
-  writeDataBytes(col2);
-
-  writeCommand(ST7735_NORON);    // Normal display mode on
-  busy_wait_us_32(10000);
-  writeCommand(ST7735_DISPON);
-  busy_wait_us_32(100000);
-
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-  busy_wait_us_32(120000);
-  writecommand(ST7735_DISPON);    //Display on
-  busy_wait_us_32(120000);
   setRotation(TDisplayRotation.None);
   ForegroundColor := clBlack;
   BackgroundColor := clWhite;
 end;
 
-procedure TST7735R_SPI.setRotation(const displayRotation : TDisplayRotation);
+procedure TST7735S_SPI.setRotation(const displayRotation : TDisplayRotation);
 var
   ColMode : byte;
 begin
@@ -245,7 +267,7 @@ begin
   end;
 end;
 
-function TST7735R_SPI.setDrawArea(const X,Y,Width,Height : word):longWord;
+function TST7735S_SPI.setDrawArea(const X,Y,Width,Height : word):longWord;
 begin
   {$PUSH}
   {$WARN 4079 OFF}
@@ -257,7 +279,7 @@ begin
   {$POP}
 end;
 
-procedure TST7735R_SPI.drawPixel(const x,y : word; const fgColor : TColor = clForeground);
+procedure TST7735S_SPI.drawPixel(const x,y : word; const fgColor : TColor = clForeground);
 var
   _fgColor : word;
 begin
@@ -271,7 +293,7 @@ begin
   WriteData(lo(_fgColor));
 end;
 
-procedure TST7735R_SPI.WriteCommand(const command: Byte);
+procedure TST7735S_SPI.WriteCommand(const command: Byte);
 var
   data: array[0..0] of byte;
 begin
@@ -281,7 +303,7 @@ begin
   gpio_put(FPinDC,true);
 end;
 
-procedure TST7735R_SPI.WriteCommandBytes(const command : byte; constref data : array of byte; Count:longInt=-1);
+procedure TST7735S_SPI.WriteCommandBytes(const command : byte; constref data : array of byte; Count:longInt=-1);
 var
   _data : array[0..0] of byte;
 begin
@@ -294,7 +316,7 @@ begin
   spi_write_blocking(FpSPI^,data,count);
 end;
 
-procedure TST7735R_SPI.WriteCommandWords(const command : byte; constref data : array of word; Count:longInt=-1);
+procedure TST7735S_SPI.WriteCommandWords(const command : byte; constref data : array of word; Count:longInt=-1);
 var
   _data : array[0..0] of byte;
 begin
@@ -307,7 +329,7 @@ begin
   spi_write_blocking_hl(FpSPI^,data,count);
 end;
 
-procedure TST7735R_SPI.WriteData(const data: byte);
+procedure TST7735S_SPI.WriteData(const data: byte);
 var
   _data : array[0..0] of byte;
 begin
@@ -316,7 +338,7 @@ begin
   spi_write_blocking(FpSPI^,_data,1);
 end;
 
-procedure TST7735R_SPI.WriteDataBytes(constref data: array of byte;Count:longInt=-1);
+procedure TST7735S_SPI.WriteDataBytes(constref data: array of byte;Count:longInt=-1);
 begin
   if count = -1 then
     count := High(data)+1;
@@ -324,7 +346,7 @@ begin
   spi_write_blocking(FpSPI^,data,count);
 end;
 
-procedure TST7735R_SPI.WriteDataWords(constref data: array of word;Count:longInt=-1);
+procedure TST7735S_SPI.WriteDataWords(constref data: array of word;Count:longInt=-1);
 begin
   if count = -1 then
     count := High(data)+1;
